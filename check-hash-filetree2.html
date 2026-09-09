@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>フォルダハッシュ値＆ツリー出力ツール</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; line-height: 1.6; }
+    button { padding: 8px 16px; font-size: 14px; cursor: pointer; margin-right: 8px; }
+    textarea { width: 100%; height: 400px; font-family: monospace; font-size: 13px; margin-top: 15px; }
+    .controls { margin-bottom: 10px; }
+    #status { font-weight: bold; margin-left: 10px; color: #555; }
+  </style>
+</head>
+<body>
+
+  <h2>フォルダツリー＆ハッシュ値出力ツール</h2>
+  <div class="controls">
+    <button id="selectDirBtn">フォルダを選択</button>
+    <button id="copyBtn" disabled>テキストをコピー</button>
+    <button id="downloadBtn" disabled>ファイル保存 (.txt)</button>
+    <span id="status"></span>
+  </div>
+
+  <textarea id="output" readonly placeholder="フォルダを選択すると、ここにツリー構造とハッシュ値が出力されます..."></textarea>
+
+  <script>
+    const selectDirBtn = document.getElementById('selectDirBtn');
+    const copyBtn = document.getElementById('copyBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const outputTextarea = document.getElementById('output');
+    const statusText = document.getElementById('status');
+
+    // SHA-256 ハッシュ計算関数
+    async function calculateHash(file) {
+      const buffer = await file.arrayBuffer();
+      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // フォルダ再帰処理関数
+    async function processDirectory(dirHandle, indent = '') {
+      let lines = [];
+      const entries = [];
+
+      for await (const entry of dirHandle.values()) {
+        entries.push(entry);
+      }
+
+      // 名前順にソート (フォルダ優先、そのあとファイル)
+      entries.sort((a, b) => {
+        if (a.kind === b.kind) return a.name.localeCompare(b.name);
+        return a.kind === 'directory' ? -1 : 1;
+      });
+
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const isLast = (i === entries.length - 1);
+        const prefix = isLast ? '└── ' : '├── ';
+        const childIndent = indent + (isLast ? '    ' : '│   ');
+
+        if (entry.kind === 'file') {
+          try {
+            const file = await entry.getFile();
+            statusText.textContent = `計算中: ${file.name}`;
+            const hash = await calculateHash(file);
+            lines.push(`${indent}${prefix}${entry.name} [SHA-256: ${hash}]`);
+          } catch (err) {
+            lines.push(`${indent}${prefix}${entry.name} [エラー: 読み込み失敗]`);
+          }
+        } else if (entry.kind === 'directory') {
+          lines.push(`${indent}${prefix}${entry.name}/`);
+          const subLines = await processDirectory(entry, childIndent);
+          lines = lines.concat(subLines);
+        }
+      }
+      return lines;
+    }
+
+    // フォルダ選択処理
+    selectDirBtn.addEventListener('click', async () => {
+      try {
+        const dirHandle = await window.showDirectoryPicker();
+        statusText.textContent = '計算中...';
+        outputTextarea.value = '';
+
+        const treeLines = await processDirectory(dirHandle);
+        const resultText = `${dirHandle.name}/\n` + treeLines.join('\n');
+
+        outputTextarea.value = resultText;
+        statusText.textContent = '完了!';
+        copyBtn.disabled = false;
+        downloadBtn.disabled = false;
+
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          alert('エラーが発生しました: ' + err.message);
+          statusText.textContent = 'エラー';
+        } else {
+          statusText.textContent = '';
+        }
+      }
+    });
+
+    // クリップボードコピー
+    copyBtn.addEventListener('click', () => {
+      outputTextarea.select();
+      navigator.clipboard.writeText(outputTextarea.value);
+      alert('クリップボードにコピーしました。');
+    });
+
+    // テキストファイルダウンロード
+    downloadBtn.addEventListener('click', () => {
+      const blob = new Blob([outputTextarea.value], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'folder_hash_tree.txt';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  </script>
+
+</body>
+</html>

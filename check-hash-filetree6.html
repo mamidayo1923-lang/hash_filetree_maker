@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>making hash-filetree v6</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; line-height: 1.6; }
+    button { padding: 8px 16px; font-size: 14px; cursor: pointer; margin-right: 8px; }
+    textarea { width: 100%; height: 450px; font-family: monospace; font-size: 13px; margin-top: 15px; }
+    .controls { margin-bottom: 10px; }
+    #status { font-weight: bold; margin-left: 10px; color: #007bff; }
+  </style>
+  <!-- WebAssemblyでネイティブ速度を出す超高速ハッシュライブラリ -->
+  <script src="https://cdn.jsdelivr.net/npm/hash-wasm@4.10.0/dist/sha256.umd.min.js"></script>
+</head>
+<body>
+
+  <h2>making hash-filetree v6 +++Faster ver.(demo)+++</h2>
+  <h3>BigFile:OK WebAssemblyVer.</h3>
+  <div class="controls">
+    <button id="selectDirBtn">フォルダを選択</button>
+    <button id="copyBtn" disabled>テキストをコピー</button>
+    <button id="downloadBtn" disabled>ファイル保存 (.txt)</button>
+    <span id="status"></span>
+  </div>
+
+  <textarea id="output" readonly placeholder="フォルダを選択すると、ここにツリー構造とハッシュ値が出力されます..."></textarea>
+
+  <script>
+    const selectDirBtn = document.getElementById('selectDirBtn');
+    const copyBtn = document.getElementById('copyBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const outputTextarea = document.getElementById('output');
+    const statusText = document.getElementById('status');
+
+    // WebAssembly(WASM) による超高速ストリーミング計算
+    async function computeSHA256Fast(file, onProgress) {
+      // WASMハッシュインスタンスを作成
+      const hasher = await hashwasm.createSHA256();
+      hasher.init();
+
+      // 64MBごとに分割してWASMのC/Rust同等エンジンに読み込ませる
+      const CHUNK_SIZE = 64 * 1024 * 1024; // 64MB
+      let offset = 0;
+
+      while (offset < file.size) {
+        const slice = file.slice(offset, offset + CHUNK_SIZE);
+        const buffer = await slice.arrayBuffer();
+        
+        // Uint8ArrayにしてWASMへ直接インプット
+        hasher.update(new Uint8Array(buffer));
+
+        offset += CHUNK_SIZE;
+        const progress = Math.min(100, Math.round((offset / file.size) * 100));
+
+        if (onProgress) {
+          onProgress(progress);
+        }
+
+        // 画面描画の更新のために少しだけ待機（WASMが速すぎるためこれでフリーズを防止）
+        await new Promise(r => setTimeout(r, 0));
+      }
+
+      return hasher.digest('hex');
+    }
+
+    // フォルダ再帰処理関数
+    async function processDirectory(dirHandle, indent = '') {
+      let lines = [];
+      const entries = [];
+
+      for await (const entry of dirHandle.values()) {
+        entries.push(entry);
+      }
+
+      // 名前順ソート（フォルダ優先、そのあとファイル名順）
+      entries.sort((a, b) => {
+        if (a.kind === b.kind) return a.name.localeCompare(b.name);
+        return a.kind === 'directory' ? -1 : 1;
+      });
+
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const isLast = (i === entries.length - 1);
+        const prefix = isLast ? '└── ' : '├── ';
+        const childIndent = indent + (isLast ? '    ' : '│   ');
+
+        if (entry.kind === 'file') {
+          try {
+            const file = await entry.getFile();
+            const sizeGB = (file.size / (1024 * 1024 * 1024)).toFixed(2);
+            const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
+            const sizeStr = file.size >= 1024 * 1024 * 1024 ? `${sizeGB} GB` : `${sizeMB} MB`;
+
+            statusText.textContent = `高速計算中 (0% - ${sizeStr}): ${file.name}`;
+
+            const hash = await computeSHA256Fast(file, (percent) => {
+              statusText.textContent = `高速計算中 (${percent}% - ${sizeStr}): ${file.name}`;
+            });
+
+            lines.push(`${indent}${prefix}${entry.name} [SHA-256: ${hash}]`);
+          } catch (err) {
+            lines.push(`${indent}${prefix}${entry.name} [エラー: ${err.message || '読み込み失敗'}]`);
+          }
+        } else if (entry.kind === 'directory') {
+          lines.push(`${indent}${prefix}${entry.name}/`);
+          const subLines = await processDirectory(entry, childIndent);
+          lines = lines.concat(subLines);
+        }
+      }
+      return lines;
+    }
+
+    // フォルダ選択処理
+    selectDirBtn.addEventListener('click', async () => {
+      try {
+        const dirHandle = await window.showDirectoryPicker();
+        statusText.textContent = '初期化中...';
+        outputTextarea.value = '';
+
+        const treeLines = await processDirectory(dirHandle);
+        const resultText = `${dirHandle.name}/\n` + treeLines.join('\n');
+
+        outputTextarea.value = resultText;
+        statusText.textContent = '完了!';
+        aleart('Finish making hush-filetree');
+        copyBtn.disabled = false;
+        downloadBtn.disabled = false;
+
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          alert('エラーが発生しました: ' + err.message);
+          statusText.textContent = 'エラー';
+        } else {
+          statusText.textContent = '';
+        }
+      }
+    });
+
+    // クリップボードコピー
+    copyBtn.addEventListener('click', () => {
+      outputTextarea.select();
+      navigator.clipboard.writeText(outputTextarea.value);
+      alert('クリップボードにコピーしました。');
+    });
+
+    // テキストファイル保存
+    downloadBtn.addEventListener('click', () => {
+      const blob = new Blob([outputTextarea.value], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'folder_hash_tree.txt';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  </script>
+
+</body>
+</html>
