@@ -13,7 +13,7 @@ V10     : 14m02s
 V11     :  2m44s  
 V11 cos.:  1m53s  
 (V11 costom is a newest code, but I didn’t upload it because it didn’t work properly a few times.)  
-I was really happy because the improvements when going from V10 to V11 used techniques I had never used before.　　
+I was really happy because the improvements when going from V10 to V11 used techniques I had never used before.  
 It also depends on your PC's specs.  
 
 If you want to know me more, click here⇩  
