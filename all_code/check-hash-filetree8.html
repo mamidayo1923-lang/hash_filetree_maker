@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>making hash-filetree</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; line-height: 1.6; }
+    button { padding: 8px 16px; font-size: 14px; cursor: pointer; margin-right: 8px; }
+    .controls { margin-bottom: 10px; }
+    
+    .progress-box {
+      background-color: #f8f9fa;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 12px;
+      margin-top: 10px;
+      margin-bottom: 10px;
+    }
+    .status-text { font-weight: bold; color: #007bff; margin-bottom: 4px; }
+    .time-text { font-size: 13px; color: #555; }
+
+    textarea { width: 100%; height: 300px; font-family: monospace; font-size: 13px; margin-top: 5px; }
+
+    .log-container { margin-top: 15px; }
+    .log-title { font-weight: bold; font-size: 14px; margin-bottom: 5px; }
+    #logWindow {
+      width: 100%;
+      height: 180px;
+      background-color: #1e1e1e;
+      color: #00ff66;
+      font-family: monospace;
+      font-size: 12px;
+      padding: 10px;
+      box-sizing: border-box;
+      overflow-y: auto;
+      border-radius: 4px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/hash-wasm@4.10.0/dist/sha256.umd.min.js"></script>
+</head>
+<body>
+
+  <h2>making hash-filetree v8 +++Faster ver.(demo)+++</h2>
+  <h3>BigFile:OK Log:OK WebAssemblyVer.</h3>
+  <div class="controls">
+    <button id="selectDirBtn">フォルダを選択</button>
+    <button id="copyBtn" disabled>テキストをコピー</button>
+    <button id="downloadBtn" disabled>ファイル保存 (.txt)</button>
+  </div>
+
+  <div class="progress-box">
+    <div id="status" class="status-text">待機中...</div>
+    <div id="timeEstimate" class="time-text">全体進捗: - | 残り時間: -</div>
+  </div>
+
+  <textarea id="output" readonly placeholder="処理が完了すると、ここにツリー構造とハッシュ値が出力されます..."></textarea>
+
+  <div class="log-container">
+    <div class="log-title">処理ログ</div>
+    <div id="logWindow"></div>
+  </div>
+
+  <script>
+    const selectDirBtn = document.getElementById('selectDirBtn');
+    const copyBtn = document.getElementById('copyBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const outputTextarea = document.getElementById('output');
+    const statusText = document.getElementById('status');
+    const timeEstimateText = document.getElementById('timeEstimate');
+    const logWindow = document.getElementById('logWindow');
+
+    let totalFilesCount = 0;
+    let processedFilesCount = 0;
+    let totalBytes = 0;
+    let processedBytes = 0;
+    let startTime = 0;
+    let lastUIUpdateTime = 0; // 前回UIを更新した時刻（ミリ秒）
+
+    function appendLog(message) {
+      const timeStr = new Date().toLocaleTimeString();
+      logWindow.textContent += `[${timeStr}] ${message}\n`;
+      logWindow.scrollTop = logWindow.scrollHeight;
+    }
+
+    function formatTime(seconds) {
+      if (!isFinite(seconds) || seconds < 0) return '計算中...';
+      if (seconds < 60) return `${Math.ceil(seconds)}秒`;
+      const m = Math.floor(seconds / 60);
+      const s = Math.ceil(seconds % 60);
+      return `${m}分 ${s}秒`;
+    }
+
+    async function scanDirectory(dirHandle) {
+      let files = [];
+      for await (const entry of dirHandle.values()) {
+        if (entry.kind === 'file') {
+          const file = await entry.getFile();
+          files.push(file);
+        } else if (entry.kind === 'directory') {
+          const subFiles = await scanDirectory(entry);
+          files = files.concat(subFiles);
+        }
+      }
+      return files;
+    }
+
+    // 進捗と予想残り時間の更新（1秒間隔で制限）
+    function updateProgress(currentFileName, currentFileLoadedBytes, currentFileSize, forceUpdate = false) {
+      const now = Date.now();
+
+      // 前回の表示更新から1秒(1000ms)未満、かつ強制更新でなければスキップ
+      if (!forceUpdate && (now - lastUIUpdateTime < 2000)) {
+        return;
+      }
+      lastUIUpdateTime = now;
+
+      const elapsedSeconds = (now - startTime) / 1000;
+      const currentTotalProcessedBytes = processedBytes + currentFileLoadedBytes;
+      const overallPercent = totalBytes > 0 ? Math.min(100, Math.floor((currentTotalProcessedBytes / totalBytes) * 100)) : 0;
+
+      let remainingTimeStr = '計算中...';
+      if (elapsedSeconds > 0.5 && currentTotalProcessedBytes > 0) {
+        const bytesPerSecond = currentTotalProcessedBytes / elapsedSeconds;
+        const remainingBytes = totalBytes - currentTotalProcessedBytes;
+        const remainingSeconds = remainingBytes / bytesPerSecond;
+        remainingTimeStr = formatTime(remainingSeconds);
+      }
+
+      statusText.textContent = `処理中 (${overallPercent}%): ${currentFileName}`;
+      timeEstimateText.textContent = `全体進捗: ${processedFilesCount} / ${totalFilesCount} ファイル (${overallPercent}%) | 予想残り時間: ${remainingTimeStr}`;
+    }
+
+    async function computeSHA256Fast(file) {
+      const hasher = await hashwasm.createSHA256();
+      hasher.init();
+
+      const CHUNK_SIZE = 64 * 1024 * 1024;
+      let offset = 0;
+
+      while (offset < file.size) {
+        const slice = file.slice(offset, offset + CHUNK_SIZE);
+        const buffer = await slice.arrayBuffer();
+        hasher.update(new Uint8Array(buffer));
+
+        offset += CHUNK_SIZE;
+        updateProgress(file.name, Math.min(offset, file.size), file.size);
+
+        await new Promise(r => setTimeout(r, 0));
+      }
+
+      return hasher.digest('hex');
+    }
+
+    async function processDirectory(dirHandle, indent = '') {
+      let lines = [];
+      const entries = [];
+
+      for await (const entry of dirHandle.values()) {
+        entries.push(entry);
+      }
+
+      entries.sort((a, b) => {
+        if (a.kind === b.kind) return a.name.localeCompare(b.name);
+        return a.kind === 'directory' ? -1 : 1;
+      });
+
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const isLast = (i === entries.length - 1);
+        const prefix = isLast ? '└── ' : '├── ';
+        const childIndent = indent + (isLast ? '    ' : '│   ');
+
+        if (entry.kind === 'file') {
+          try {
+            const file = await entry.getFile();
+            appendLog(`計算開始: ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MB)`);
+
+            const hash = await computeSHA256Fast(file);
+            
+            processedBytes += file.size;
+            processedFilesCount++;
+            
+            // ファイル1個が完了したときは即座に画面を更新(forceUpdate = true)
+            updateProgress(file.name, file.size, file.size, true);
+
+            appendLog(`完了: ${file.name} -> ${hash}`);
+            lines.push(`${indent}${prefix}${entry.name} [SHA-256: ${hash}]`);
+          } catch (err) {
+            appendLog(`エラー: ${entry.name} - ${err.message || '読み込み失敗'}`);
+            lines.push(`${indent}${prefix}${entry.name} [エラー: ${err.message || '読み込み失敗'}]`);
+          }
+        } else if (entry.kind === 'directory') {
+          lines.push(`${indent}${prefix}${entry.name}/`);
+          appendLog(`フォルダに入ります: ${entry.name}`);
+          const subLines = await processDirectory(entry, childIndent);
+          lines = lines.concat(subLines);
+        }
+      }
+      return lines;
+    }
+
+    selectDirBtn.addEventListener('click', async () => {
+      try {
+        const dirHandle = await window.showDirectoryPicker();
+        
+        logWindow.textContent = '';
+        outputTextarea.value = '';
+        processedFilesCount = 0;
+        processedBytes = 0;
+        lastUIUpdateTime = 0;
+        
+        statusText.textContent = 'フォルダ構造をスキャン中...';
+        appendLog(`選択されたフォルダ: ${dirHandle.name}`);
+
+        const allFiles = await scanDirectory(dirHandle);
+        totalFilesCount = allFiles.length;
+        totalBytes = allFiles.reduce((acc, f) => acc + f.size, 0);
+        
+        const totalGB = (totalBytes / (1024 * 1024 * 1024)).toFixed(2);
+        appendLog(`スキャン完了: 合計 ${totalFilesCount} 個のファイル (計 ${totalGB} GB)`);
+
+        startTime = Date.now();
+
+        const treeLines = await processDirectory(dirHandle);
+        const resultText = `${dirHandle.name}/\n` + treeLines.join('\n');
+
+        outputTextarea.value = resultText;
+        
+        const totalElapsed = formatTime((Date.now() - startTime) / 1000);
+        statusText.textContent = '処理完了!';
+        alert('処理が終了しました');
+        timeEstimateText.textContent = `全体進捗: ${totalFilesCount} / ${totalFilesCount} ファイル (100%) | 所要時間: ${totalElapsed}`;
+        appendLog(`=== 全処理が完了しました (所要時間: ${totalElapsed}) ===`);
+
+        copyBtn.disabled = false;
+        downloadBtn.disabled = false;
+
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          alert('エラーが発生しました: ' + err.message);
+          statusText.textContent = 'エラー発生';
+          appendLog(`致命的エラー: ${err.message}`);
+        } else {
+          statusText.textContent = 'キャンセルされました';
+          appendLog('処理がキャンセルされました。');
+        }
+      }
+    });
+
+    copyBtn.addEventListener('click', () => {
+      outputTextarea.select();
+      navigator.clipboard.writeText(outputTextarea.value);
+      alert('クリップボードにコピーしました。');
+    });
+
+    downloadBtn.addEventListener('click', () => {
+      const blob = new Blob([outputTextarea.value], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'folder_hash_tree.txt';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  </script>
+
+</body>
+</html>
