@@ -1,0 +1,1195 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>making hash-filetree v11</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; line-height: 1.6; }
+    button { padding: 8px 16px; font-size: 14px; cursor: pointer; margin-right: 8px; }
+    .controls { margin-bottom: 10px; }
+
+    .progress-box {
+      background-color: #f8f9fa;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 12px;
+      margin-top: 10px;
+      margin-bottom: 10px;
+    }
+
+    .status-text { font-weight: bold; color: #007bff; margin-bottom: 4px; }
+    .time-text { font-size: 13px; color: #555; }
+
+    textarea {
+      width: 100%;
+      height: 300px;
+      font-family: monospace;
+      font-size: 13px;
+      margin-top: 5px;
+    }
+
+    .log-container { margin-top: 15px; }
+    .log-title { font-weight: bold; font-size: 14px; margin-bottom: 5px; }
+
+    #logWindow {
+      width: 100%;
+      height: 180px;
+      background-color: #1e1e1e;
+      color: #00ff66;
+      font-family: monospace;
+      font-size: 12px;
+      padding: 10px;
+      box-sizing: border-box;
+      overflow-y: auto;
+      border-radius: 4px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+  </style>
+
+  <script src="https://cdn.jsdelivr.net/npm/hash-wasm@4.10.0/dist/sha256.umd.min.js"></script>
+</head>
+
+<body>
+
+  <h2>making hash-filetree v11 +++Faster ver.(demo)+++</h2>
+  <h3>BigFile:OK Log:OK ParallelProcessing:OK WebAssemblyVer. RGProject</h3>
+
+  <div class="controls">
+    <button id="selectDirBtn">フォルダを選択</button>
+    <button id="copyBtn" disabled>テキストをコピー</button>
+    <button id="downloadBtn" disabled>ファイル保存 (.txt)</button>
+  </div>
+
+  <div class="progress-box">
+    <div id="status" class="status-text">待機中...</div>
+    <div id="timeEstimate" class="time-text">全体進捗: - </div>
+  </div>
+
+  <textarea
+    id="output"
+    readonly
+    placeholder="処理が完了すると、ここにツリー構造とハッシュ値が出力されます..."
+  ></textarea>
+
+  <div class="log-container">
+    <div class="log-title">処理ログ</div>
+    <div id="logWindow"></div>
+  </div>
+
+<script>
+/* =========================================================
+   UI
+========================================================= */
+
+const selectDirBtn = document.getElementById('selectDirBtn');
+const copyBtn = document.getElementById('copyBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+
+const outputTextarea = document.getElementById('output');
+const statusText = document.getElementById('status');
+const timeEstimateText = document.getElementById('timeEstimate');
+const logWindow = document.getElementById('logWindow');
+
+
+/* =========================================================
+   Global State
+========================================================= */
+
+let totalFilesCount = 0;
+let processedFilesCount = 0;
+
+let totalBytes = 0;
+let processedBytes = 0;
+
+let startTime = 0;
+let lastUIUpdateTime = 0;
+
+/*
+ * ログそのものは高速にメモリへ蓄積。
+ * DOMへの反映は1秒ごと。
+ */
+let logBuffer = [];
+let displayedLogCount = 0;
+let logFlushTimer = null;
+
+
+/* =========================================================
+   Worker Configuration
+========================================================= */
+
+/*
+ * ブラウザが報告する論理CPU数を使用。
+ *
+ * あまりWorkerを増やしすぎると逆に遅くなるため、
+ * 最大6 Workerに制限する。
+ */
+const logicalCPU =
+  Number.isInteger(navigator.hardwareConcurrency)
+    ? navigator.hardwareConcurrency
+    : 4;
+
+const WORKER_COUNT = Math.max(
+  2,
+  Math.min(6, logicalCPU - 2)
+);
+
+
+/* =========================================================
+   Time
+========================================================= */
+
+function formatTime(seconds) {
+  if (!isFinite(seconds) || seconds < 0) {
+    return '計算中...';
+  }
+
+  if (seconds < 60) {
+    return `${Math.ceil(seconds)}秒`;
+  }
+
+  const m = Math.floor(seconds / 60);
+  const s = Math.ceil(seconds % 60);
+
+  return `${m}分 ${s}秒`;
+}
+
+
+/* =========================================================
+   Logging
+========================================================= */
+
+/*
+ * ログ生成自体はDOMを触らない。
+ */
+function appendLog(message) {
+  const timeStr = new Date().toLocaleTimeString();
+  logBuffer.push(`[${timeStr}] ${message}`);
+}
+
+
+/*
+ * ログ画面更新。
+ *
+ * 重要:
+ * 「ログ更新は1秒ごと」という指定に合わせ、
+ * 通常時は1000ms間隔でのみDOMを更新する。
+ */
+function flushLogs(force = false) {
+
+  if (!force && displayedLogCount === logBuffer.length) {
+    return;
+  }
+
+  if (logBuffer.length === 0) {
+    return;
+  }
+
+  /*
+   * ログ全体を毎回作り直さず、
+   * 新規分だけ追加する。
+   */
+  const newLogs = logBuffer
+    .slice(displayedLogCount)
+    .join('\n');
+
+  if (newLogs.length > 0) {
+
+    if (logWindow.textContent.length > 0) {
+      logWindow.textContent += '\n';
+    }
+
+    logWindow.textContent += newLogs;
+
+    displayedLogCount = logBuffer.length;
+
+    logWindow.scrollTop = logWindow.scrollHeight;
+  }
+}
+
+
+/*
+ * 1秒ごとのログ更新タイマー。
+ */
+function startLogFlushTimer() {
+
+  stopLogFlushTimer();
+
+  logFlushTimer = setInterval(() => {
+    flushLogs(false);
+  }, 1000);
+}
+
+
+function stopLogFlushTimer() {
+
+  if (logFlushTimer !== null) {
+    clearInterval(logFlushTimer);
+    logFlushTimer = null;
+  }
+}
+
+
+/* =========================================================
+   Progress UI
+========================================================= */
+
+function updateProgress(
+  currentFileName,
+  currentFileLoadedBytes,
+  forceUpdate = false
+) {
+
+  const now = Date.now();
+
+  /*
+   * 進捗UIも高頻度更新しない。
+   */
+  if (
+    !forceUpdate &&
+    (now - lastUIUpdateTime < 1000)
+  ) {
+    return;
+  }
+
+  lastUIUpdateTime = now;
+
+  const elapsedSeconds =
+    (now - startTime) / 1000;
+
+  const currentTotalProcessedBytes =
+    processedBytes + currentFileLoadedBytes;
+
+  const overallPercent =
+    totalBytes > 0
+      ? Math.min(
+          100,
+          Math.floor(
+            (currentTotalProcessedBytes / totalBytes) * 100
+          )
+        )
+      : 0;
+
+  let remainingTimeStr = '計算中...';
+
+  if (
+    elapsedSeconds > 0.5 &&
+    currentTotalProcessedBytes > 0
+  ) {
+
+    const bytesPerSecond =
+      currentTotalProcessedBytes / elapsedSeconds;
+
+    const remainingBytes =
+      Math.max(
+        0,
+        totalBytes - currentTotalProcessedBytes
+      );
+
+    const remainingSeconds =
+      remainingBytes / bytesPerSecond;
+
+    remainingTimeStr =
+      formatTime(remainingSeconds);
+  }
+
+  statusText.textContent =
+    `処理中 (${overallPercent}%): ${currentFileName}`;
+
+  timeEstimateText.textContent =
+    `全体進捗: ${processedFilesCount} / ${totalFilesCount} ファイル`;
+}
+
+
+/* =========================================================
+   Directory Scan
+========================================================= */
+
+/*
+ * 共有配列へ直接pushする方式。
+ *
+ * concat()による巨大配列の再生成を避ける。
+ */
+async function scanDirectory(
+  dirHandle,
+  fileList = []
+) {
+
+  for await (const entry of dirHandle.values()) {
+
+    if (entry.kind === 'file') {
+
+      const file = await entry.getFile();
+
+      fileList.push({
+        file,
+        name: entry.name
+      });
+
+    } else if (entry.kind === 'directory') {
+
+      await scanDirectory(
+        entry,
+        fileList
+      );
+    }
+  }
+
+  return fileList;
+}
+
+
+/* =========================================================
+   Tree Collection
+========================================================= */
+
+/*
+ * フォルダを再度探索する必要をなくすため、
+ * 最初の探索時にツリー構造も保存する。
+ *
+ * この関数ではハッシュ計算は行わない。
+ */
+async function buildTreeAndJobs(
+  dirHandle,
+  indent = '',
+  output = [],
+  jobs = []
+) {
+
+  const entries = [];
+
+  for await (const entry of dirHandle.values()) {
+    entries.push(entry);
+  }
+
+  /*
+   * 現在の仕様と同じ並び順。
+   *
+   * 1. directory
+   * 2. file
+   *
+   * 同一種類なら名前順。
+   */
+  entries.sort((a, b) => {
+
+    if (a.kind === b.kind) {
+      return a.name.localeCompare(b.name);
+    }
+
+    return a.kind === 'directory'
+      ? -1
+      : 1;
+  });
+
+
+  for (let i = 0; i < entries.length; i++) {
+
+    const entry = entries[i];
+
+    const isLast =
+      i === entries.length - 1;
+
+    const prefix =
+      isLast
+        ? '└── '
+        : '├── ';
+
+    const childIndent =
+      indent +
+      (
+        isLast
+          ? '    '
+          : '│   '
+      );
+
+
+    if (entry.kind === 'directory') {
+
+      output.push(
+        `${indent}${prefix}${entry.name}/`
+      );
+
+      appendLog(
+        `フォルダに入ります: ${entry.name}`
+      );
+
+      await buildTreeAndJobs(
+        entry,
+        childIndent,
+        output,
+        jobs
+      );
+
+    } else {
+
+      const file =
+        await entry.getFile();
+
+      const jobIndex =
+        jobs.length;
+
+      jobs.push({
+        index: jobIndex,
+        file,
+        name: entry.name,
+        indent,
+        prefix
+      });
+
+      /*
+       * 後でWorkerの結果を入れるため、
+       * 配列の位置を予約。
+       */
+      output.push(null);
+    }
+  }
+
+  return {
+    output,
+    jobs
+  };
+}
+
+
+/* =========================================================
+   Worker Source
+========================================================= */
+
+/*
+ * 外部Workerファイルを必要としないよう、
+ * WorkerコードをBlobから生成する。
+ *
+ * hash-wasmはWorker側でもCDNからロードする。
+ */
+const workerSource = `
+importScripts(
+  'https://cdn.jsdelivr.net/npm/hash-wasm@4.10.0/dist/sha256.umd.min.js'
+);
+
+const CHUNK_SIZE = 64 * 1024 * 1024;
+
+self.onmessage = async function(event) {
+
+  const data = event.data;
+
+  if (data.type !== 'hash') {
+    return;
+  }
+
+  const id = data.id;
+  const file = data.file;
+
+  try {
+
+    const hasher =
+      await hashwasm.createSHA256();
+
+    hasher.init();
+
+    let offset = 0;
+
+    while (offset < file.size) {
+
+      const end =
+        Math.min(
+          offset + CHUNK_SIZE,
+          file.size
+        );
+
+      const slice =
+        file.slice(offset, end);
+
+      const buffer =
+        await slice.arrayBuffer();
+
+      hasher.update(
+        new Uint8Array(buffer)
+      );
+
+      offset = end;
+
+      /*
+       * Workerから進捗だけ通知。
+       *
+       * メイン側では1秒間隔に
+       * UI更新を制限する。
+       */
+      self.postMessage({
+        type: 'progress',
+        id,
+        loaded: offset,
+        size: file.size
+      });
+    }
+
+    const hash =
+      hasher.digest('hex');
+
+    self.postMessage({
+      type: 'done',
+      id,
+      hash,
+      size: file.size
+    });
+
+  } catch (error) {
+
+    self.postMessage({
+      type: 'error',
+      id,
+      message:
+        error && error.message
+          ? error.message
+          : '読み込み失敗'
+    });
+  }
+};
+`;
+
+
+/* =========================================================
+   Worker Pool
+========================================================= */
+
+function createWorkerPool() {
+
+  const blob =
+    new Blob(
+      [workerSource],
+      { type: 'application/javascript' }
+    );
+
+  const workerURL =
+    URL.createObjectURL(blob);
+
+  const workers = [];
+
+  for (
+    let i = 0;
+    i < WORKER_COUNT;
+    i++
+  ) {
+
+    const worker =
+      new Worker(workerURL);
+
+    workers.push({
+      worker,
+      busy: false,
+      jobId: null
+    });
+  }
+
+  return {
+    workers,
+    workerURL
+  };
+}
+
+
+/* =========================================================
+   Parallel Hash Processing
+========================================================= */
+
+async function processJobsParallel(
+  jobs,
+  treeOutput
+) {
+
+  return new Promise((resolve) => {
+
+    if (jobs.length === 0) {
+      resolve();
+      return;
+    }
+
+
+    const pool =
+      createWorkerPool();
+
+    let nextJobIndex = 0;
+    let completedJobs = 0;
+
+
+    /*
+     * Worker終了処理。
+     */
+    function terminatePool() {
+
+      for (const item of pool.workers) {
+        item.worker.terminate();
+      }
+
+      URL.revokeObjectURL(
+        pool.workerURL
+      );
+    }
+
+
+    /*
+     * 次のJobをWorkerへ投入。
+     */
+    function assignNext(item) {
+
+      if (
+        nextJobIndex >= jobs.length
+      ) {
+        item.busy = false;
+        item.jobId = null;
+
+        if (
+          completedJobs >= jobs.length
+        ) {
+          terminatePool();
+          resolve();
+        }
+
+        return;
+      }
+
+
+      const job =
+        jobs[nextJobIndex++];
+
+      item.busy = true;
+      item.jobId = job.index;
+
+
+      appendLog(
+        `計算開始: ${job.name} (${(job.file.size / (1024 * 1024)).toFixed(1)} MB)`
+      );
+
+
+      item.worker.postMessage({
+        type: 'hash',
+        id: job.index,
+        file: job.file
+      });
+    }
+
+
+    /*
+     * Workerごとのイベント。
+     */
+    for (const item of pool.workers) {
+
+      item.worker.onmessage =
+        function(event) {
+
+          const data =
+            event.data;
+
+
+          if (data.type === 'progress') {
+
+            /*
+             * UI更新は1秒制限。
+             */
+            const job =
+              jobs[data.id];
+
+            if (job) {
+
+              updateProgress(
+                job.name,
+                data.loaded,
+                false
+              );
+            }
+
+            return;
+          }
+
+
+          if (data.type === 'done') {
+
+            const job =
+              jobs[data.id];
+
+            if (!job) {
+              return;
+            }
+
+
+            processedBytes +=
+              job.file.size;
+
+            processedFilesCount++;
+
+
+            /*
+             * 完了時だけ強制更新。
+             */
+            updateProgress(
+              job.name,
+              job.file.size,
+              true
+            );
+
+
+            appendLog(
+              `完了: ${job.name} -> ${data.hash}`
+            );
+
+
+            /*
+             * 元のツリー位置へ結果を書き込む。
+             */
+            treeOutput[data.id] =
+              `${job.indent}${job.prefix}${job.name} [SHA-256: ${data.hash}]`;
+
+
+            completedJobs++;
+
+
+            item.busy = false;
+            item.jobId = null;
+
+
+            assignNext(item);
+
+            return;
+          }
+
+
+          if (data.type === 'error') {
+
+            const job =
+              jobs[data.id];
+
+            if (!job) {
+              return;
+            }
+
+
+            appendLog(
+              `エラー: ${job.name} - ${data.message}`
+            );
+
+
+            treeOutput[data.id] =
+              `${job.indent}${job.prefix}${job.name} [エラー: ${data.message}]`;
+
+
+            processedFilesCount++;
+
+            processedBytes +=
+              job.file.size;
+
+
+            updateProgress(
+              job.name,
+              job.file.size,
+              true
+            );
+
+
+            completedJobs++;
+
+
+            item.busy = false;
+            item.jobId = null;
+
+
+            assignNext(item);
+
+            return;
+          }
+        };
+
+
+      item.worker.onerror =
+        function(error) {
+
+          /*
+           * Worker自体の異常。
+           *
+           * 該当Jobが存在する場合はエラーとして扱う。
+           */
+          if (
+            item.jobId !== null
+          ) {
+
+            const job =
+              jobs[item.jobId];
+
+            if (job) {
+
+              const message =
+                error.message ||
+                'Workerエラー';
+
+              appendLog(
+                `エラー: ${job.name} - ${message}`
+              );
+
+              treeOutput[item.jobId] =
+                `${job.indent}${job.prefix}${job.name} [エラー: ${message}]`;
+
+              processedFilesCount++;
+
+              processedBytes +=
+                job.file.size;
+
+              completedJobs++;
+            }
+          }
+
+
+          item.busy = false;
+          item.jobId = null;
+
+
+          /*
+           * 新しいWorkerを作成。
+           */
+          try {
+            item.worker.terminate();
+
+            const replacement =
+              new Worker(pool.workerURL);
+
+            item.worker =
+              replacement;
+
+            replacement.onmessage =
+              item.worker.onmessage;
+
+          } catch (_) {
+            // 回復できない場合は無視。
+          }
+
+
+          assignNext(item);
+        };
+
+
+      /*
+       * 初期Job投入。
+       */
+      assignNext(item);
+    }
+
+  });
+}
+
+
+/* =========================================================
+   Main Processing
+========================================================= */
+
+selectDirBtn.addEventListener(
+  'click',
+  async () => {
+
+    try {
+
+      const dirHandle =
+        await window.showDirectoryPicker();
+
+
+      /*
+       * UI初期化
+       */
+      logWindow.textContent = '';
+      outputTextarea.value = '';
+
+      logBuffer = [];
+      displayedLogCount = 0;
+
+      processedFilesCount = 0;
+      processedBytes = 0;
+
+      totalFilesCount = 0;
+      totalBytes = 0;
+
+      lastUIUpdateTime = 0;
+
+
+      statusText.textContent =
+        'フォルダ構造をスキャン中...';
+
+      appendLog(
+        `選択されたフォルダ: ${dirHandle.name}`
+      );
+
+
+      /*
+       * ログ更新開始。
+       * 画面への更新は1秒ごと。
+       */
+      startLogFlushTimer();
+
+
+      /*
+       * =====================================================
+       * フォルダを1回だけ走査
+       * =====================================================
+       */
+
+      const treeOutput = [];
+      const jobs = [];
+
+
+      /*
+       * ツリーとJob情報を同時に構築。
+       */
+      await buildTreeAndJobs(
+        dirHandle,
+        '',
+        treeOutput,
+        jobs
+      );
+
+
+      /*
+       * 総ファイル数。
+       */
+      totalFilesCount =
+        jobs.length;
+
+
+      /*
+       * 総容量。
+       */
+      totalBytes =
+        jobs.reduce(
+          (total, job) =>
+            total + job.file.size,
+          0
+        );
+
+
+      const totalGB =
+        (
+          totalBytes /
+          (1024 * 1024 * 1024)
+        ).toFixed(2);
+
+
+      appendLog(
+        `スキャン完了: 合計 ${totalFilesCount} 個のファイル (計 ${totalGB} GB)`
+      );
+
+
+      /*
+       * ハッシュ処理開始。
+       */
+      startTime = Date.now();
+
+
+      if (jobs.length > 0) {
+
+        statusText.textContent =
+          'ハッシュ計算を開始しています...';
+
+
+        /*
+         * =================================================
+         * 並列SHA-256
+         * =================================================
+         */
+        await processJobsParallel(
+          jobs,
+          treeOutput
+        );
+      }
+
+
+      /*
+       * =====================================================
+       * 最終出力
+       * =====================================================
+       */
+
+      const resultText =
+        `${dirHandle.name}/\n` +
+        treeOutput.join('\n');
+
+
+      outputTextarea.value =
+        resultText;
+
+
+      const totalElapsed =
+        formatTime(
+          (Date.now() - startTime) / 1000
+        );
+
+
+      /*
+       * 最終UI更新
+       */
+      statusText.textContent =
+        '処理完了!';
+      
+
+
+      timeEstimateText.textContent =
+        `全体進捗: ${totalFilesCount} / ${totalFilesCount} ファイル (100%) | 所要時間: ${totalElapsed}`;
+
+
+      appendLog(
+        `=== 全処理が完了しました (所要時間: ${totalElapsed}) ===`
+      );
+
+
+      /*
+       * 最後のログだけは即時表示。
+       */
+      flushLogs(true);
+
+      stopLogFlushTimer();
+
+
+      alert(
+        'Finish making hush-filetree! Thanks for using this tool!'
+      );
+
+
+      copyBtn.disabled = false;
+      downloadBtn.disabled = false;
+
+
+    } catch (err) {
+
+      stopLogFlushTimer();
+
+
+      /*
+       * 最終ログを表示。
+       */
+      flushLogs(true);
+
+
+      if (
+        err.name !== 'AbortError'
+      ) {
+
+        alert(
+          'エラーが発生しました: ' +
+          err.message
+        );
+
+        statusText.textContent =
+          'エラー発生';
+
+        appendLog(
+          `致命的エラー: ${err.message}`
+        );
+
+        flushLogs(true);
+
+      } else {
+
+        statusText.textContent =
+          'キャンセルされました';
+
+        appendLog(
+          '処理がキャンセルされました。'
+        );
+
+        flushLogs(true);
+      }
+    }
+  }
+);
+
+
+/* =========================================================
+   Copy
+========================================================= */
+
+copyBtn.addEventListener(
+  'click',
+  async () => {
+
+    try {
+
+      outputTextarea.select();
+
+      await navigator.clipboard.writeText(
+        outputTextarea.value
+      );
+
+      alert(
+        'クリップボードにコピーしました。'
+      );
+
+    } catch (err) {
+
+      /*
+       * Clipboard APIが使えない環境用。
+       */
+      outputTextarea.select();
+
+      document.execCommand('copy');
+
+      alert(
+        'クリップボードにコピーしました。'
+      );
+    }
+  }
+);
+
+
+/* =========================================================
+   Download
+========================================================= */
+
+downloadBtn.addEventListener(
+  'click',
+  () => {
+
+    const blob =
+      new Blob(
+        [outputTextarea.value],
+        {
+          type:
+            'text/plain;charset=utf-8'
+        }
+      );
+
+
+    const url =
+      URL.createObjectURL(blob);
+
+
+    const a =
+      document.createElement('a');
+
+
+    a.href = url;
+
+    a.download =
+      'folder_hash_tree.txt';
+
+
+    a.click();
+
+
+    URL.revokeObjectURL(url);
+  }
+);
+
+
+/* =========================================================
+   Initial State
+========================================================= */
+
+statusText.textContent =
+  '待機中...';
+
+timeEstimateText.textContent =
+  '全体進捗: -';
+
+</script>
+<a href="https://github.com/mamidayo1923-lang/RemGrowingHome">If you want to know me, click me!</a>
+</body>
+</html>
+
+<!--[V10->V11]Added parallelism to process small files faster.-->
+<!--
+2026/09/10 00:57
+2週間ほど前、ある人と勇気を出してとても重要な会話をしたのだが、その日は夜遅かったためまた後日返事をもらえることになっていた。しかし２週間たっても返事がない。やっぱりそのことを大切で重要なことだと思っているのは僕のほうだけなのだろうか。正直言って忘れられたのではととても悲しい。
+-->
