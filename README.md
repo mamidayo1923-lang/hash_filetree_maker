@@ -17,4 +17,4 @@ I was really happy because the improvements when going from V10 to V11 used tech
 It also depends on your PC's specs.  
 
 If you want to know me more, click here⇩  
-<a href="https://github.com/mamidayo1923-lang/RemGrowingHome/edit/main/README.md">RemGrowing-Home</a>
+<a href="https://github.com/mamidayo1923-lang/RemGrowingHome">RemGrowing-Home</a>
